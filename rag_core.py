@@ -1,41 +1,41 @@
-# rag_core.py
+# rag_core.py (TF-IDF 轻量版，无需HuggingFace和torch)
 #
-# RAG 핵심 로직:
-# - 업로드된 문서를 텍스트로 추출/분할
-# - 임베딩으로 벡터DB 생성 (Chroma)
-# - 사용자 질문과 가장 비슷한 문서조각을 찾아서 답변 후보 생성
+# 思路：
+# 1. 把上传的文档切成chunk
+# 2. 用 TfidfVectorizer 把所有chunk向量化
+# 3. 用户提问 -> 也向量化 -> 计算余弦相似度
+# 4. 取最相似的片段，组成回答
 #
-# OpenAI 결제 없이 동작하도록 sentence-transformers 기반 임베딩 사용.
+# 这样依然是“基于我上传的文档回答”，符合RAG逻辑，
+# 而且不用huggingface模型，所以Streamlit Cloud不会报ImportError。
 
-import io
 from typing import List, Tuple
+import io
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
 from langchain_text_splitters import CharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
 
 
 def load_file_to_text(file_bytes: bytes, filename: str) -> str:
     """
-    업로드된 파일을 텍스트로 변환하는 간단한 함수.
-    현재는 .txt / .md / .csv / .py 등 '텍스트 기반' 파일 위주로 처리.
-    PDF 등 복잡한 포맷은 여기서 확장 가능.
+    简单读取文本型文件。对PDF等复杂格式暂时不做OCR，只尝试直接decode。
     """
     lower_name = filename.lower()
-    # 가장 단순한 방식: 그냥 utf-8 디코딩 시도
+
+    # 直接按utf-8读
     try:
         text = file_bytes.decode("utf-8", errors="ignore")
         return text
     except Exception:
         pass
 
-    # 혹시 모를 다른 인코딩
+    # 备用编码
     try:
         text = file_bytes.decode("cp949", errors="ignore")
         return text
     except Exception:
         pass
 
-    # 마지막 fallback: 바이너리 -> 빈 문자열
     return ""
 
 
@@ -43,8 +43,7 @@ def split_text_to_chunks(text: str,
                          chunk_size: int = 500,
                          chunk_overlap: int = 100) -> List[str]:
     """
-    긴 텍스트를 작은 청크로 나누기.
-    chunk_size / chunk_overlap 값은 너무 공격적으로 키우지 않음 (학생 난이도).
+    把长文本切成小段，保留一定重叠，方便检索。
     """
     splitter = CharacterTextSplitter(
         separator="\n",
@@ -56,76 +55,83 @@ def split_text_to_chunks(text: str,
     return chunks
 
 
+class SimpleVectorStore:
+    """
+    一个很轻量的向量库：
+    - 用 TF-IDF 把所有chunk编码成向量矩阵
+    - 做余弦相似度检索
+    """
+
+    def __init__(self, chunks: List[str]):
+        self.chunks = chunks  # 文本片段列表
+        self.vectorizer = TfidfVectorizer()
+        if chunks:
+            self.matrix = self.vectorizer.fit_transform(chunks)  # shape: (num_chunks, vocab_dim)
+        else:
+            self.matrix = None
+
+    def similarity_search(self, query: str, k: int = 3) -> List[Tuple[str, float]]:
+        """
+        返回与query最相似的k个chunk，附带相似度分数。
+        """
+        if (self.matrix is None) or (not query.strip()):
+            return []
+
+        q_vec = self.vectorizer.transform([query])  # shape: (1, vocab_dim)
+
+        # 余弦相似度 = (A · B) / (||A||*||B||)
+        # 这里使用稀疏矩阵乘法得到点积，再除以范数
+        dot_scores = (self.matrix @ q_vec.T).toarray().ravel()  # (num_chunks,)
+        doc_norms = np.linalg.norm(self.matrix.toarray(), axis=1) + 1e-10
+        q_norm = np.linalg.norm(q_vec.toarray()) + 1e-10
+        cosine_scores = dot_scores / (doc_norms * q_norm)
+
+        # 排序，取top k
+        idx_sorted = np.argsort(cosine_scores)[::-1]  # 从大到小
+        top_idx = idx_sorted[:k]
+
+        results = []
+        for i in top_idx:
+            results.append((self.chunks[i], float(cosine_scores[i])))
+
+        return results
+
+
 def build_vectorstore_from_chunks(chunks: List[str]):
     """
-    청크 리스트를 받아서 Chroma 벡터스토어를 메모리 상에 생성.
-    HuggingFace 임베딩 모델 사용 → 무료.
-    모델은 소형 SBERT 계열을 사용해 학생 환경에서도 비교적 가볍게 동작.
+    使用SimpleVectorStore，而不是HuggingFaceEmbeddings+Chroma。
     """
     if not chunks:
         return None
-
-    embedding_model = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-
-    vectorstore = Chroma.from_texts(
-        texts=chunks,
-        embedding=embedding_model
-    )
-    return vectorstore
-
-
-def retrieve_similar_passages(
-    vectorstore,
-    query: str,
-    k: int = 3
-) -> List[Tuple[str, float]]:
-    """
-    사용자의 질문(query)과 유사한 상위 k개 문단을 검색.
-    반환: [(문단내용, 유사도 점수), ...]
-    """
-    if vectorstore is None:
-        return []
-
-    docs_and_scores = vectorstore.similarity_search_with_score(query, k=k)
-
-    results = []
-    for doc, score in docs_and_scores:
-        results.append((doc.page_content, score))
-    return results
+    return SimpleVectorStore(chunks)
 
 
 def build_answer_from_passages(query: str,
                                passages: List[Tuple[str, float]]) -> str:
     """
-    OpenAI 유료 API 없이 답변을 "생성"하는 방식.
-    - 상위 관련 문단들을 뽑아서 요약 형태로 보여준다.
-    - '근거 기반 답변'처럼 보이도록 구성.
+    根据检索到的片段，组合一个"基于你的文档"的回答。
+    不调用OpenAI，完全免费。
     """
     if not passages:
         return (
-            "📘 관련 내용을 찾지 못했습니다.\n"
-            "업로드한 문서에 해당 질문과 유사한 내용이 거의 없거나\n"
-            "아직 문서를 업로드하지 않았을 수 있어요. 🍐"
+            "📘 没找到和问题强相关的内容。\n"
+            "可能还没有成功解析这个文件，或者文档内容和提问差距太大。🍐"
         )
 
     answer_lines = []
-    answer_lines.append("🍐 질문: " + query.strip())
+    answer_lines.append("🍐 你的问题： " + query.strip())
     answer_lines.append("")
-    answer_lines.append("📚 문서에서 찾은 관련 내용 요약:")
+    answer_lines.append("📚 根据你上传的文档，最相关的内容是：")
 
     for idx, (text_block, score) in enumerate(passages, start=1):
-        # 너무 긴 블록을 한 번 더 잘라서 깔끔하게
-        short_preview = text_block.strip()
-        if len(short_preview) > 400:
-            short_preview = short_preview[:400] + " ..."
-
-        answer_lines.append(f"\n[{idx}] {short_preview}")
+        preview = text_block.strip()
+        if len(preview) > 400:
+            preview = preview[:400] + " ..."
+        answer_lines.append(f"\n[{idx}] 相似度 {score:.3f}\n{preview}")
 
     answer_lines.append(
-        "\n✿ 위 내용은 업로드된 문서에서 직접 검색된 근거입니다.\n"
-        "✿ 즉, 이 챗봇은 일반적인 지식이 아니라 '내 자료'를 기반으로 답해요.\n"
+        "\n✿ 提示：以上回答只来自你上传的资料（本地检索），"
+        "并不是互联网通用知识。\n"
     )
 
     return "\n".join(answer_lines)
@@ -133,35 +139,32 @@ def build_answer_from_passages(query: str,
 
 class RAGSessionState:
     """
-    Streamlit 세션과 연결해서 쓸 작은 상태 관리용 클래스.
-    - 업로드 문서 전체 텍스트
-    - 잘라낸 청크
-    - 벡터스토어
+    保存会话状态：
+    - 所有原始文本
+    - 切分后的chunks
+    - 一个TF-IDF向量库
     """
     def __init__(self):
-        self.raw_texts = []        # 원본 텍스트들 (파일별)
-        self.all_chunks = []       # 잘린 청크 전체
-        self.vectorstore = None    # Chroma 벡터스토어
+        self.raw_texts = []
+        self.all_chunks = []
+        self.vectorstore = None
 
     def add_document(self, file_bytes: bytes, filename: str):
         """
-        새 파일을 세션에 추가하고, 전체 벡터스토어를 다시 빌드한다.
-        (간단하게 '덮어쓰기' 식으로 재구성)
+        添加新文件后，重新构建chunks和向量库（简单粗暴版，足够学生作业）。
         """
         text = load_file_to_text(file_bytes, filename)
         if text.strip():
             self.raw_texts.append(text)
 
-        # 모든 문서를 합쳐서 다시 청크화
         merged = "\n\n".join(self.raw_texts)
         chunks = split_text_to_chunks(merged)
         self.all_chunks = chunks
         self.vectorstore = build_vectorstore_from_chunks(chunks)
 
     def ask(self, query: str) -> str:
-        """
-        사용자의 질문에 대해 RAG 검색 후 요약형 답변 생성.
-        """
-        passages = retrieve_similar_passages(self.vectorstore, query)
+        if self.vectorstore is None:
+            return "还没有可检索的内容，请先上传文档 🍐"
+        passages = self.vectorstore.similarity_search(query, k=3)
         answer = build_answer_from_passages(query, passages)
         return answer
